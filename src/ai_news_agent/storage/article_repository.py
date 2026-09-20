@@ -44,6 +44,8 @@ class SaveResult:
     duplicates: int = 0
     failed: int = 0
     errors: list[str] = field(default_factory=list)
+    inserted_articles: list[Article] = field(default_factory=list)
+    inserted_ids: list[int] = field(default_factory=list)
 
 
 class ArticleRepository:
@@ -69,6 +71,18 @@ class ArticleRepository:
                 created_at TEXT NOT NULL
             )
         """)
+        self.connection.execute("""
+            CREATE TABLE IF NOT EXISTS article_analyses (
+                article_id INTEGER PRIMARY KEY REFERENCES articles(id) ON DELETE CASCADE,
+                model TEXT NOT NULL,
+                category TEXT NOT NULL,
+                relevance_score INTEGER NOT NULL CHECK(relevance_score BETWEEN 0 AND 10),
+                summary TEXT NOT NULL,
+                key_points TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                analyzed_at TEXT NOT NULL
+            )
+        """)
         self.connection.commit()
 
     def __enter__(self) -> "ArticleRepository":
@@ -80,7 +94,7 @@ class ArticleRepository:
     def close(self) -> None:
         self.connection.close()
 
-    def _insert(self, article: Article) -> bool:
+    def _insert(self, article: Article) -> tuple[bool, int | None]:
         if not isinstance(article, Article):
             raise TypeError("expected an Article")
         url = normalize_url(article.url)
@@ -99,13 +113,14 @@ class ArticleRepository:
             _utc_text(article.collected_at),
             datetime.now(timezone.utc).isoformat(),
         ))
-        return cursor.rowcount == 1
+        return cursor.rowcount == 1, (cursor.lastrowid if cursor.rowcount == 1 else None)
 
     def save(self, article: Article) -> bool:
         """Return True for a new row, False for an existing normalized URL."""
 
         with self.connection:
-            return self._insert(article)
+            inserted, _ = self._insert(article)
+            return inserted
 
     def save_many(self, articles: Iterable[Article]) -> SaveResult:
         """Save valid records even when another record in the batch fails."""
@@ -114,14 +129,47 @@ class ArticleRepository:
         with self.connection:
             for index, article in enumerate(articles, start=1):
                 try:
-                    if self._insert(article):
+                    inserted, article_id = self._insert(article)
+                    if inserted:
                         result.inserted += 1
+                        result.inserted_articles.append(article)
+                        result.inserted_ids.append(article_id)
                     else:
                         result.duplicates += 1
                 except (TypeError, ValueError, sqlite3.Error) as exc:
                     result.failed += 1
                     result.errors.append(f"article {index}: {exc}")
         return result
+
+    def has_analysis(self, article_id: int) -> bool:
+        row = self.connection.execute(
+            "SELECT 1 FROM article_analyses WHERE article_id = ?", (article_id,)
+        ).fetchone()
+        return row is not None
+
+    def save_analysis(self, article_id: int, analysis: object, model: str) -> None:
+        """Persist one validated ArticleAnalysis without altering Article rows."""
+        with self.connection:
+            self.connection.execute("""
+                INSERT INTO article_analyses
+                (article_id, model, category, relevance_score, summary, key_points, reason, analyzed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(article_id) DO UPDATE SET
+                    model=excluded.model, category=excluded.category,
+                    relevance_score=excluded.relevance_score, summary=excluded.summary,
+                    key_points=excluded.key_points, reason=excluded.reason,
+                    analyzed_at=excluded.analyzed_at
+            """, (article_id, model, analysis.category, analysis.relevance_score,
+                  analysis.summary, json.dumps(analysis.key_points, ensure_ascii=False),
+                  analysis.reason, datetime.now(timezone.utc).isoformat()))
+
+    def get_analysis(self, article_id: int) -> dict | None:
+        row = self.connection.execute(
+            "SELECT * FROM article_analyses WHERE article_id = ?", (article_id,)
+        ).fetchone()
+        if not row:
+            return None
+        return {**dict(row), "key_points": json.loads(row["key_points"])}
 
     def exists(self, url: str) -> bool:
         row = self.connection.execute(

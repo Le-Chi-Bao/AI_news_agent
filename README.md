@@ -1,13 +1,11 @@
 # AI News Agent
 
-Project Python tổng hợp tin AI. Phase 4 hiện có RSS collector, arXiv collector và SQLite storage. Các bước LLM, báo cáo và gửi email nằm trong roadmap.
+Project Python tổng hợp tin AI. Phase 6 hiện có RSS, arXiv, Web Search, SQLite storage và tùy chọn LLM analysis. LangGraph, báo cáo và email nằm trong roadmap.
 
 ## Kiến trúc
 
 ```text
-RSS ───────┐
-arXiv ─────┼── collectors → Article → SQLite repository → NEW / DUPLICATE
-Search ────┘
+RSS / arXiv / Search → Article → SQLite / Dedup → NEW only → LLM → ArticleAnalysis
 ```
 
 Collector chỉ chuyển dữ liệu Internet thành `Article`. CLI gửi Article vào repository; repository phụ trách lưu và chống trùng. `Article.source` là tên nguồn như `arXiv` hoặc tên RSS feed, còn `source_type` là `rss`/`arxiv`.
@@ -23,6 +21,7 @@ Collector chỉ chuyển dữ liệu Internet thành `Article`. CLI gửi Articl
 | `src/ai_news_agent/rss_sources.py` | RSS URLs mặc định. |
 | `src/ai_news_agent/arxiv_config.py` | Category, keyword, khoảng ngày và giới hạn kết quả arXiv. |
 | `src/ai_news_agent/search_config.py` | Query và giới hạn Web Search mặc định. |
+| `src/ai_news_agent/processing/llm.py` | LLMProvider, OpenAI provider, ArticleAnalysis và ArticleProcessor. |
 | `src/ai_news_agent/storage/article_repository.py` | Tạo bảng SQLite, lưu, chống trùng và truy vấn Article. |
 | `src/ai_news_agent/main.py` | CLI chạy RSS, arXiv hoặc cả hai rồi lưu SQLite. |
 | `tests/` | Unit tests RSS, arXiv và SQLite; dùng dữ liệu mẫu và database tạm. |
@@ -75,13 +74,19 @@ Search dùng `TAVILY_API_KEY` từ environment variable hoặc file `.env` ở p
 
 Nếu chỉ truyền `--keyword`, CLI tìm trong 5 category mặc định. `--recent-days 0` tắt lọc ngày. Collector lấy metadata mới nhất từ từng category, lọc keyword trong title/abstract và ngày phát hành tại máy, gộp paper trùng category, rồi trả tối đa `max_results`. `ARXIV_SCAN_LIMIT` giới hạn số metadata quét mỗi category; paper nằm ngoài phạm vi quét có thể không xuất hiện. Collector đợi 3 giây giữa các yêu cầu arXiv API.
 
-CLI in số Article thu được theo nguồn, tối đa 5 bài mẫu, rồi `Collected`, `New`, `Duplicates`, `Failed` và đường dẫn database. Lỗi của một RSS feed hoặc arXiv category không làm mất kết quả từ nguồn khác. CLI trả mã thoát 1 nếu có lỗi nguồn hoặc lưu trữ.
+CLI in số Article thu được theo nguồn, tối đa 5 bài mẫu, rồi `Collected`, `New`, `Duplicates`, `Failed` và đường dẫn database. Dùng `--analyze` để gửi đúng các Article vừa insert trong lần chạy hiện tại tới LLM. Article duplicate và Article đã có analysis không bị gửi lại. Nếu thiếu `OPENAI_API_KEY`, CLI báo lỗi cấu hình; collect không có `--analyze` vẫn chạy bình thường.
+
+```powershell
+python -m ai_news_agent.main --source all --analyze
+```
+
+LLM dùng `OPENAI_API_KEY` và `LLM_MODEL` từ environment hoặc `.env`. Provider yêu cầu JSON có category, relevance score 0–10, summary, key points và reason; prompt buộc model chỉ dựa trên Article metadata/abstract/snippet, không tự bịa sự kiện, URL hoặc số liệu. Content gửi API bị giới hạn 12.000 ký tự và không bao giờ có PDF.
 
 ## SQLite và chống trùng
 
 Bảng `articles` chứa `id`, `title`, `url`, `source`, `source_type`, `source_id`, `published_at`, `content`, `authors`, `collected_at`, `created_at`. `content` lưu `Article.summary`, tức mô tả RSS hoặc abstract arXiv gốc; chưa có tóm tắt do LLM tạo. `authors` lưu dưới dạng JSON. Ngày giờ lưu theo ISO 8601 UTC. `created_at` là lúc insert, còn `collected_at` là lúc tạo Article.
 
-`url` có `UNIQUE` constraint trong SQLite. Repository trim URL, bỏ fragment, chuyển scheme/host thành chữ thường và bỏ cổng mặc định trước khi insert hoặc tìm kiếm; path và query được giữ nguyên. Nhờ đó lần chạy sau gặp cùng URL sẽ báo duplicate thay vì thêm hàng mới. `save_many` trả số mới/trùng/lỗi và chi tiết lỗi; Article lỗi không làm mất các Article hợp lệ trong batch. `list_recent` sắp theo ngày phát hành hoặc ngày insert nếu thiếu ngày phát hành.
+`url` có `UNIQUE` constraint trong SQLite. Repository trim URL, bỏ fragment, chuyển scheme/host thành chữ thường và bỏ cổng mặc định trước khi insert hoặc tìm kiếm; path và query được giữ nguyên. Nhờ đó lần chạy sau gặp cùng URL sẽ báo duplicate thay vì thêm hàng mới. `save_many` trả số mới/trùng/lỗi và danh sách Article/id mới để processing dùng. Bảng `article_analyses` liên kết bằng `article_id`, có model, category, score, summary, key points, reason và analyzed_at; đây là trạng thái đã phân tích, tách khỏi Article gốc.
 
 Để reset database khi phát triển, đóng các process đang dùng nó rồi chạy:
 
@@ -98,6 +103,6 @@ Lệnh trên xóa dữ liệu đã lưu; lần chạy CLI tiếp theo tạo data
 3. **Phase 3 — hoàn thành:** semantics `source`/`source_type`, arXiv collector và tests.
 4. **Phase 4 — hoàn thành:** SQLite repository, chống trùng URL và nối CLI với storage.
 5. **Phase 5 — hoàn thành:** Tavily Web Search collector và provider abstraction.
-6. **Phase 6:** phân loại, ranking và tóm tắt qua LLM API.
+6. **Phase 6 — hoàn thành:** LLM provider abstraction, structured ArticleAnalysis và xử lý Article mới.
 7. **Phase 7:** LangGraph orchestration và Daily Report HTML/PDF.
 8. **Phase 8:** gửi email và chạy theo lịch bằng GitHub Actions.

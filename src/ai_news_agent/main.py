@@ -18,6 +18,7 @@ from ai_news_agent.collectors.rss import collect_feeds
 from ai_news_agent.rss_sources import RSS_FEED_URLS
 from ai_news_agent.storage import ArticleRepository
 from ai_news_agent.search_config import SEARCH_MAX_RESULTS, SEARCH_QUERIES, SEARCH_TIME_RANGE
+from ai_news_agent.processing import ArticleProcessor, LLMProviderError, OpenAIProvider
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -36,6 +37,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="arXiv submission window in days; 0 disables date filter")
     parser.add_argument("--query", action="append", help="Web search query; repeat to add more")
     parser.add_argument("--search-max-results", type=int, default=SEARCH_MAX_RESULTS)
+    parser.add_argument("--analyze", action="store_true", help="Analyze only newly inserted articles with the LLM")
     args = parser.parse_args(argv)
 
     articles = []
@@ -67,7 +69,32 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Database: {args.database}")
     for error in saved.errors:
         print(f"  [ERROR] {error}")
-    return 1 if source_errors or saved.failed else 0
+    analysis_failed = 0
+    if args.analyze:
+        try:
+            processor = ArticleProcessor(OpenAIProvider())
+        except LLMProviderError as exc:
+            print(f"[ERROR] LLM configuration: {exc}")
+            return 1
+        with ArticleRepository(args.database) as repository:
+            # Persist one by one so failures retain the correct article_id relationship.
+            from ai_news_agent.processing.llm import BatchResult
+            batch = BatchResult()
+            for article_id, article in zip(saved.inserted_ids, saved.inserted_articles):
+                try:
+                    analysis = processor.analyze(article)
+                    repository.save_analysis(article_id, analysis, processor.provider.model)
+                    batch.processed += 1
+                    batch.results.append(analysis)
+                except Exception as exc:
+                    batch.failed += 1
+                    batch.errors.append(f"article {article_id}: {exc}")
+        print(f"Analysis processed: {batch.processed}")
+        print(f"Analysis failed: {batch.failed}")
+        analysis_failed = batch.failed
+        for error in batch.errors:
+            print(f"  [ERROR] {error}")
+    return 1 if source_errors or saved.failed or analysis_failed else 0
 
 
 def _run_rss(args: argparse.Namespace) -> tuple[list, int]:
