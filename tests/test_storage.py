@@ -111,6 +111,8 @@ class CliStorageTests(unittest.TestCase):
             )
             with patch("ai_news_agent.main.collect_feeds", return_value=rss), \
                  patch("ai_news_agent.main.collect_arxiv", return_value=ArxivResult(articles=[arxiv_paper])), \
+                 patch("ai_news_agent.main.TavilySearchProvider"), \
+                 patch("ai_news_agent.main.collect_search", return_value=[]), \
                  redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(main(["--source", "all", "--database", path]), 0)
                 first = output.getvalue()

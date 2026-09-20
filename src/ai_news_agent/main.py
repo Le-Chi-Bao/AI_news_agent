@@ -4,18 +4,25 @@ import argparse
 import os
 import sqlite3
 
+from dotenv import load_dotenv
+
+# Load only the real .env file (python-dotenv does not load .env.example).
+load_dotenv()
+
 from ai_news_agent.arxiv_config import (
     ARXIV_CATEGORIES, ARXIV_KEYWORDS, ARXIV_MAX_RESULTS, ARXIV_RECENT_DAYS,
 )
+from ai_news_agent.collectors.search import SearchProviderError, TavilySearchProvider, collect_search
 from ai_news_agent.collectors.arxiv import collect_arxiv
 from ai_news_agent.collectors.rss import collect_feeds
 from ai_news_agent.rss_sources import RSS_FEED_URLS
 from ai_news_agent.storage import ArticleRepository
+from ai_news_agent.search_config import SEARCH_MAX_RESULTS, SEARCH_QUERIES, SEARCH_TIME_RANGE
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Collect and store RSS articles or arXiv papers")
-    parser.add_argument("--source", choices=("rss", "arxiv", "all"), default="rss")
+    parser.add_argument("--source", choices=("rss", "arxiv", "search", "all"), default="rss")
     parser.add_argument("--database", default=os.getenv("DATABASE_PATH", "data/ai_news.db"),
                         metavar="PATH", help="SQLite database path")
     parser.add_argument(
@@ -27,6 +34,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-results", type=int, default=ARXIV_MAX_RESULTS)
     parser.add_argument("--recent-days", type=int, default=ARXIV_RECENT_DAYS,
                         help="arXiv submission window in days; 0 disables date filter")
+    parser.add_argument("--query", action="append", help="Web search query; repeat to add more")
+    parser.add_argument("--search-max-results", type=int, default=SEARCH_MAX_RESULTS)
     args = parser.parse_args(argv)
 
     articles = []
@@ -39,6 +48,10 @@ def main(argv: list[str] | None = None) -> int:
         arxiv_articles, arxiv_errors = _run_arxiv(args)
         articles.extend(arxiv_articles)
         source_errors += arxiv_errors
+    if args.source in ("search", "all"):
+        search_articles, search_errors = _run_search(args)
+        articles.extend(search_articles)
+        source_errors += search_errors
 
     try:
         with ArticleRepository(args.database) as repository:
@@ -103,6 +116,31 @@ def _run_arxiv(args: argparse.Namespace) -> tuple[list, int]:
         print(f"Published: {article.published_at.isoformat() if article.published_at else 'unknown'}")
         print(f"URL: {article.url}")
     return result.articles, 0
+
+
+def _run_search(args: argparse.Namespace) -> tuple[list, int]:
+    print("Collecting Web Search...\n")
+    try:
+        provider = TavilySearchProvider()
+    except SearchProviderError as exc:
+        print(f"[ERROR] search configuration: {exc}")
+        return [], 1
+    results = collect_search(
+        args.query if args.query is not None else SEARCH_QUERIES,
+        provider,
+        max_results=args.search_max_results,
+        time_range=SEARCH_TIME_RANGE,
+    )
+    articles = []
+    for result in results:
+        if result.error:
+            print(f"[ERROR] {result.query}: {result.error}")
+        else:
+            print(f"[OK] {result.query}: {len(result.articles)} results")
+            articles.extend(result.articles)
+        for warning in result.warnings:
+            print(f"  [WARN] {warning}")
+    return articles, sum(bool(result.error) for result in results)
 
 
 if __name__ == "__main__":
